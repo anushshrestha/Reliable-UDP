@@ -38,7 +38,7 @@ public class Sender {
 
     // CLASS OutThread
     public class OutThread extends Thread {
-        private DatagramSocket sk_out;
+        private DatagramSocket sk_out; //socket out 
         private int dst_port;
         private InetAddress dst_addr;
         private int recv_port;
@@ -80,8 +80,8 @@ public class Sender {
                     while (!isTransferComplete) {
                         // send packets if window is not yet full
                         if (nextSeqNum < base + win_size) {
-
-                            s.acquire(); /***** enter CS *****/
+														
+                          	s.acquire(); /***** enter CS *****/
                             if (base == nextSeqNum)
                                 setTimer(true); // if first packet of window, start timer
 
@@ -167,8 +167,7 @@ public class Sender {
             byte[] ackNumBytes = copyOfRange(pkt, 8, 12);
             CRC32 checksum = new CRC32();
             checksum.update(ackNumBytes);
-            byte[] calculated_checksumBytes = ByteBuffer.allocate(8).putLong(checksum.getValue()).array();// checksum (8
-                                                                                                          // bytes)
+            byte[] calculated_checksumBytes = ByteBuffer.allocate(8).putLong(checksum.getValue()).array();// checksum (8// bytes)
             if (Arrays.equals(received_checksumBytes, calculated_checksumBytes))
                 return ByteBuffer.wrap(ackNumBytes).getInt();
             else

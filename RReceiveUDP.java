@@ -1,4 +1,3 @@
-
 import java.awt.List;
 import java.io.File;
 import java.io.FileOutputStream;
@@ -6,6 +5,7 @@ import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.SocketException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
@@ -17,8 +17,7 @@ import java.util.Vector;
 import java.util.concurrent.Semaphore;
 import java.util.zip.CRC32;
 
-// Import from inet.java
-import edu.utulsa.unet.UDPSocket; //import java.net.DatagramSocket;
+import edu.utulsa.unet.UDPSocket;
 import edu.utulsa.unet.RReceiveUDPI;
 
 public class RReceiveUDP implements RReceiveUDPI {
@@ -28,25 +27,14 @@ public class RReceiveUDP implements RReceiveUDPI {
 	long TIME_OUT = 1000; // in millisecond
 	String receiverFileName;
 	int localPort = 32456;
+	int MTU = 20;
 
 	int prevSeqNum; // previous sequence number received in-order
 	int nextSeqNum; // next expected sequence number
-	boolean isTransferComplete;// (flag) if transfer is complete
-	int MTU = 20;
-	int pkt_size = MTU;
-	Semaphore s;
 	TreeMap<Integer, byte[]> packetsList;
-
 	Timer timer;
-
-	public RReceiveUDP() {
-		try {
-			System.out.println("Receiver: local IP: " + InetAddress.getLocalHost().getHostAddress() + " ARQ Algorithm: "
-					+ getModeName() + " ,local UDP port: " + getLocalPort());
-		} catch (Exception e) {
-			e.printStackTrace();
-		}
-	}
+	Semaphore s;
+	boolean isTransferComplete;// (flag) if transfer is complete
 
 	public static void main(String[] args) {
 		RReceiveUDP receiver = new RReceiveUDP();
@@ -57,34 +45,20 @@ public class RReceiveUDP implements RReceiveUDPI {
 		receiver.receiveFile();
 	}
 
-	public int getLargestContinuousSequenceNumber(Vector<byte[]> packetsList) {
-		// Object minObj = Collections.min(packetsList.get(nextSeqNum));
-		return nextSeqNum;
-	}
-
 	public boolean receiveFile() {
+		// used by both threads
+		int prevSeqNum = -1; // previous sequence number received in-order
+		int nextSeqNum = 0; // next expected sequence number
+		boolean isTransferComplete = false; // (flag) if transfer is complete
+		s = new Semaphore(1);
+		packetsList = new TreeMap<Integer, byte[]>();
+
 		try {
-			int prevSeqNum = -1; // previous sequence number received in-order
-			int nextSeqNum = 0; // next expected sequence number
-			boolean isTransferComplete = false; // (flag) if transfer is complete
-			s = new Semaphore(1);
-			packetsList = new TreeMap<Integer, byte[]>();
-
-			int inDatagramDestinationPort = getLocalPort();
-
-			int outDatagramDestinationPort = 23456;
-			DatagramSocket outDatagramSocket, inDatagramSocket;
-			// create sockets
-			outDatagramSocket = new DatagramSocket(); // outgoing channel
-			inDatagramSocket = new DatagramSocket(32456); // incoming channel
-
 			// create threads to process data
-			InConnectionThread th_in = new InConnectionThread(inDatagramSocket);
-			OutConnectionThread th_out = new OutConnectionThread(outDatagramSocket, outDatagramDestinationPort,
-					inDatagramDestinationPort);
+			InConnectionThread th_in = new InConnectionThread();
+			OutConnectionThread th_out = new OutConnectionThread();
 			th_in.start();
 			th_out.start();
-
 		} catch (Exception e) {
 			e.printStackTrace();
 			System.exit(-1);
@@ -97,84 +71,82 @@ public class RReceiveUDP implements RReceiveUDPI {
 		DatagramSocket inConnectionSocket, outConnectionSocket;
 		int sourcePort;
 		int destinationPort;
-
-		// InConnectionThread constructor
-		public InConnectionThread(DatagramSocket inConnectionSocket) {
-			this.inConnectionSocket = inConnectionSocket;
-		}
+		int inDatagramDestinationPort = getLocalPort();
+		FileOutputStream fileOutputStream = null;
 
 		public void run() {
 			try {
-				FileOutputStream fos = new FileOutputStream(receiverFileName);
+				inConnectionSocket = new DatagramSocket(null);
+				InetSocketAddress address = new InetSocketAddress("127.0.0.1", getLocalPort());
+				inConnectionSocket.bind(address);
+
+				byte[] inData = new byte[getWindowSize()]; // message data in packet
+
 				outConnectionSocket = new DatagramSocket();
-				System.out.println("Receiver: Listening ");
+				InetAddress destinationAddress;
+
+				fileOutputStream = new FileOutputStream(receiverFileName);
+
+				System.out.println("Receiver: local IP: " + InetAddress.getLocalHost().getHostAddress() + " ARQ Algorithm: "
+						+ getModeName() + " ,local UDP port: " + getLocalPort());
+
+				System.out.println("Receiver: Listening " + getLocalPort());
+
 				try {
-					byte[] in_data = new byte[pkt_size]; // message data in packet
-					DatagramPacket in_pkt = new DatagramPacket(in_data, in_data.length); // incoming packet
-					InetAddress dst_addr = InetAddress.getByName("172.17.34.56");
+					DatagramPacket inPacket = new DatagramPacket(inData, inData.length); // incoming packet
+					destinationAddress = InetAddress.getByName("127.0.0.1");
 					File file = new File(receiverFileName);
 
 					boolean isFinalSequeunceNum = false;
-					int windowSize = 0;
 					while (!isTransferComplete) {
 						if (packetsList.size() <= getWindowSize() && !isFinalSequeunceNum) {
 							s.acquire();
-							try {
-								System.out.println("1");
-								inConnectionSocket.receive(in_pkt);
-								System.out.println("2");
-							} catch (IOException e) {
-								e.printStackTrace();
-							}
 
-							byte[] received_checksum = copyOfRange(in_data, 0, 8);
+							inConnectionSocket.receive(inPacket);
+
+							destinationAddress = inConnectionSocket.getInetAddress();
+							destinationPort = inConnectionSocket.getPort();
+
+							byte[] received_checksum = copyOfRange(inData, 0, 8);
 							CRC32 checksum = new CRC32();
-							checksum.update(copyOfRange(in_data, 8, in_pkt.getLength()));
+							checksum.update(copyOfRange(inData, 8, inPacket.getLength()));
 							byte[] calculated_checksum = ByteBuffer.allocate(8).putLong(checksum.getValue()).array();
 
 							// if packet is not corrupted
 							if (Arrays.equals(received_checksum, calculated_checksum)) {
-
-								byte[] inData = new byte[getWindowSize()];
-
-								int seqNum = ByteBuffer.wrap(copyOfRange(in_data, 8, 12)).getInt();
+								int seqNum = ByteBuffer.wrap(copyOfRange(inData, 8, 12)).getInt();
 								System.out.println("Receiver: Received sequence number: " + seqNum);
-
-								// in order or not in order store if in limit of window
-
-								byte[] payload = new byte[in_pkt.getLength() - 12];
-								payload = copyOfRange(in_data, 12, in_pkt.getLength() - 12);
+								// in order or not in order store in list
+								byte[] payload = new byte[inPacket.getLength() - 12];
+								payload = copyOfRange(inData, 12, inPacket.getLength() - 12);
 								packetsList.put(seqNum, payload);
 
 								// if final packet
-								if (in_pkt.getLength() == 12) {
+								if (inPacket.getLength() == 12) {
 									// send ack
 									byte[] ackPkt = generatePacket(-2);
-									outConnectionSocket.send(new DatagramPacket(ackPkt, ackPkt.length, dst_addr, destinationPort));
+									outConnectionSocket.send(new DatagramPacket(ackPkt, ackPkt.length, destinationAddress, destinationPort));
 									isFinalSequeunceNum = true;
 									System.out.println("Receiver: All packets received!");
-								} else { // other packet
-
-									// in order = update pointer and remove
+								} else { // normal packets
+									// in order packets remove
 									if (seqNum == nextSeqNum) {
 										int largestContinuousSeqNum = nextSeqNum;
-										// update pointer and create file to largest seq number
-
-										// for latest in order packet
-
-										fos.write(packetsList.get(nextSeqNum));
+										// for latest in order packet send ack, remove from list, change pointers
+										fileOutputStream.write(packetsList.get(nextSeqNum));
 										byte[] ackPkt = generatePacket(prevSeqNum);
-										outConnectionSocket.send(new DatagramPacket(ackPkt, ackPkt.length, dst_addr, destinationPort));
+										outConnectionSocket.send(new DatagramPacket(ackPkt, ackPkt.length, destinationAddress, destinationPort));
 										System.out.println("Receiver: Sent Ack for " + seqNum);
 										packetsList.remove(nextSeqNum);
 										prevSeqNum = seqNum; // previous received in order
 										nextSeqNum++; // next expected
 
+										// for other pending acks, select largest continuous ack, remove from list,
+										// change pointers
 										if (packetsList.size() > 1) {
-											// for other pending acks
 											for (int i = nextSeqNum; i <= packetsList.lastKey(); i++) {
 												if (packetsList.containsKey(i)) {
-													fos.write(packetsList.get(nextSeqNum));
+													fileOutputStream.write(packetsList.get(nextSeqNum));
 													packetsList.remove(nextSeqNum);
 													prevSeqNum = seqNum; // previous received in order
 													nextSeqNum++; // next expected
@@ -183,17 +155,17 @@ public class RReceiveUDP implements RReceiveUDPI {
 											}
 											// send ack only for largest one
 											ackPkt = generatePacket(largestContinuousSeqNum);
-											outConnectionSocket.send(new DatagramPacket(ackPkt, ackPkt.length, dst_addr, destinationPort));
+											outConnectionSocket.send(new DatagramPacket(ackPkt, ackPkt.length, destinationAddress, destinationPort));
 											System.out.println("Receiver: Sent Ack for " + seqNum);
 										}
-
 									}
 								}
 							} // else packet is corrupted
 							else {
 								System.out.println("Receiver: Corrupt packet dropped.");
 								// byte[] ackPkt = generatePacket(prevSeqNum);
-								// outConnectionSocket.send(new DatagramPacket(ackPkt, ackPkt.length, dst_addr,
+								// outConnectionSocket.send(new DatagramPacket(ackPkt, ackPkt.length,
+								// destinationAddress,
 								// destinationPort));
 								// System.out.println("Receiver: Sent duplicate Ack " + prevSeqNum);
 							}
@@ -208,7 +180,7 @@ public class RReceiveUDP implements RReceiveUDPI {
 				} finally {
 					setTimer(false);
 					inConnectionSocket.close();
-					fos.close();
+					fileOutputStream.close();
 					System.out.println("Receiver: inConnectionSocket closed!");
 				}
 			} catch (Exception e) {
@@ -221,18 +193,9 @@ public class RReceiveUDP implements RReceiveUDPI {
 
 	// send ack
 	public class OutConnectionThread extends Thread {
-
 		private DatagramSocket inConnectionSocket, outConnnectionSocket;
 		private int sourcePort;
 		private int destinationPort;
-
-		// constructor
-		public OutConnectionThread(DatagramSocket outConnectionSocket, int sourcePort, int destinationPort) {
-			this.outConnnectionSocket = outConnectionSocket;
-			this.destinationPort = destinationPort;
-			this.sourcePort = sourcePort;
-		}
-
 	}
 
 	// generate Ack packet
