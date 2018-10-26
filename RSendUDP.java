@@ -40,7 +40,7 @@ public class RSendUDP implements RSendUDPI {
   Timer timer;
   Semaphore s;
   boolean isTransferComplete;
-  DatagramSocket dgSocket;
+  UDPSocket dgSocket;
   int frameCounter = 0;
   int numberOfFrame;
   long fileLength;
@@ -66,7 +66,7 @@ public class RSendUDP implements RSendUDPI {
 
     try {
       // create threads to process data
-      dgSocket = new DatagramSocket(getLocalPort());
+      dgSocket = new UDPSocket(getLocalPort());
       receiveThread rThread = new receiveThread();
       sendThread sThread = new sendThread();
       rThread.start();
@@ -162,8 +162,8 @@ public class RSendUDP implements RSendUDPI {
               if (dataLength == -1) {
                 System.out.println("Sender : Message EOF packet sent with " + totalBytes + " bytes of actual data");
               } else {
-                System.out.println("Sender : Message " + nextSeqInWindow + " sent with " + totalBytes
-                    + " bytes of actual data.");
+                System.out.println(
+                    "Sender : Message " + nextSeqInWindow + " sent with " + totalBytes + " bytes of actual data.");
               }
 
               if (!isFinalSequenceNum) {
@@ -224,8 +224,7 @@ public class RSendUDP implements RSendUDPI {
               } else { // else normal ack
 
                 // packetList.remove(ackNum);
-                System.out.println(
-                    "Sender : Message " + ackNum + " acknowledged.");
+                System.out.println("Sender : Message " + ackNum + " acknowledged.");
                 // packetList.remove(ackNum);
 
                 baseSeqOfWindow = ackNum; // update baseSeqOfWindow number

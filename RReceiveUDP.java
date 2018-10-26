@@ -37,7 +37,7 @@ public class RReceiveUDP implements RReceiveUDPI {
 	Timer timer;
 	Semaphore s;
 	boolean isTransferComplete;// (flag) if transfer is complete
-	DatagramSocket dgSocket;
+	UDPSocket dgSocket;
 	int numberOfFrame = 0;
 
 	public static void main(String[] args) {
@@ -56,7 +56,7 @@ public class RReceiveUDP implements RReceiveUDPI {
 		packetList = new TreeMap<Integer, byte[]>();
 
 		try {
-			dgSocket = new DatagramSocket(localPort);
+			dgSocket = new UDPSocket(localPort);
 			// create threads to process data
 			receiveThread rThread = new receiveThread();
 			sendThread sThread = new sendThread();
