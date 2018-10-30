@@ -10,14 +10,13 @@ import java.util.TreeMap;
 import java.util.concurrent.Semaphore;
 import java.util.Calendar;
 import java.util.GregorianCalendar;
+import java.util.Map;
 
 import edu.utulsa.unet.UDPSocket;
 import edu.utulsa.unet.RSendUDPI;
 
 /*
  *TODO : destination file empty - fix final packet having data from previous
- *         packet - first packet having larger size - on packet loss or delay in
- *         unet.properties, timer is not restarted
  */
 /**
  *
@@ -35,11 +34,12 @@ public class RSendUDP implements RSendUDPI {
 	int localPort = 12987;
 	InetSocketAddress receiverInfo;
 	int MTU = 200;
-	int headerLength = 4;
+	int headerLength = 4 + 4 + 4; // sequence no + lengthto use, number of frame
 
 	int lastAckReceived = 0; // LAR last acknowledgement received
 	int lastMsgSent = 1; // LFS last frame sent
 	TreeMap<Integer, byte[]> packetList;
+	TreeMap<Integer, Timer> timerList;
 	Timer timer;
 	Semaphore s;
 	boolean isTransferComplete;
@@ -49,6 +49,14 @@ public class RSendUDP implements RSendUDPI {
 	long fileLength;
 	int timerCounter = 0;
 	StartTime startTimer;
+	String localIPAddress, fileName;
+	int retransmission = 0;
+
+	int payloadLength;
+	int sizeOfLastPayload;
+	int rPort;
+	boolean timerisOut = false;
+	FileInputStream fis = null;
 
 	class StartTime {
 		private final double startMilSeconds;
@@ -90,13 +98,26 @@ public class RSendUDP implements RSendUDPI {
 		// fileName = getFilename();
 		s = new Semaphore(1);
 		packetList = new TreeMap<Integer, byte[]>();
+		timerList = new TreeMap<Integer, Timer>();
 		isTransferComplete = false;
 
 		startTimer = new StartTime();
 
 		try {
 			// create threads to process data
+			localIPAddress = InetAddress.getLocalHost().getHostAddress();
+			fileName = getFilename();
+			fileLength = new File(fileName).length();
+
 			dgSocket = new UDPSocket(getLocalPort());
+			MTU = dgSocket.getSendBufferSize();
+			payloadLength = MTU - headerLength;
+
+			int totalBytesToSend = (int) fileLength;
+			numberOfFrame = totalBytesToSend / payloadLength + 1;
+
+			sizeOfLastPayload = totalBytesToSend % payloadLength;
+
 			receiveThread rThread = new receiveThread();
 			sendThread sThread = new sendThread();
 			rThread.start();
@@ -108,142 +129,122 @@ public class RSendUDP implements RSendUDPI {
 		return true;
 	}
 
+	public void sendPayload(int lastMsgSent) {
+		String rInetAddress;
+
+		boolean isFinalSequenceNum = false;
+		InetSocketAddress address = new InetSocketAddress(localIPAddress, localPort);
+		rInetAddress = getReceiver().getHostName();
+		rPort = getReceiver().getPort();
+
+		byte[] outData = new byte[MTU];
+		// check in buffer if ack lost need to re send
+		if (packetList.containsKey(lastMsgSent)) {
+			// re-sending
+			outData = packetList.get(lastMsgSent);
+		} else {
+			outData = new byte[MTU];
+
+			int dataLength = 0;
+			byte[] dataBuffer, dataBytes;
+
+			if (lastMsgSent == numberOfFrame) { // lastMsgSend = pointer to next msg to send
+				payloadLength = sizeOfLastPayload;
+			}
+
+			byte[] lengthToUseBytes = ByteBuffer.allocate(4).putInt(payloadLength).array();
+			byte[] numberOfFrameBytes = ByteBuffer.allocate(4).putInt(numberOfFrame).array();
+
+			try {
+
+				dataBuffer = new byte[payloadLength];
+				dataLength = fis.read(dataBuffer, 0, payloadLength);
+				// last payload read means all un ack packets are in window
+				if (dataLength == -1) { // no more data to be read
+					isFinalSequenceNum = true;
+					// outData = generatePacket(lastMsgSent, new byte[0]);
+					// System.out.println("Sender : File read completed");
+					// fis.close();
+					// after sending add to window
+				}
+				dataBytes = copyOfRange(dataBuffer, 0, payloadLength);
+				ByteBuffer BB = ByteBuffer.allocate(MTU - 4); // except seq number
+				BB.put(lengthToUseBytes);
+				BB.put(numberOfFrameBytes);
+				BB.put(dataBytes);
+				outData = generatePacket(lastMsgSent, BB.array());
+			} catch (Exception e) {
+				e.printStackTrace();
+			}
+		}
+
+		try {
+			dgSocket.send(new DatagramPacket(outData, outData.length, InetAddress.getByName("localhost"), rPort));
+			if (packetList.size() < getWindowSize()) {
+				packetList.put(lastMsgSent, outData);
+			}
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
+
+		// after sending add to window
+		int totalBytes = outData.length;
+		System.out.println("Sender : Message " + lastMsgSent + " sent with " + payloadLength + " bytes of actual data."
+				+ " Last ack received : " + lastAckReceived + " Added : " + lastMsgSent + " Window :" + getKeysFromWindow());
+	}
+
+	public void prepareValues() {
+		// add 4 bytes because in first frame 4 byte is taken by num of frames
+		// + 1 adding last frame
+
+		int localPort = getLocalPort();
+		String destinationIPAddress = getReceiver().getAddress().getHostAddress();
+
+		System.out.println("Sending " + fileName + " from " + localIPAddress + ":" + localPort + " to "
+				+ destinationIPAddress + ":" + rPort + " with " + fileLength + " bytes");
+		System.out.println("Sender : Using " + getModeName());
+		System.out.println("Sender : No of frames: " + numberOfFrame + " and Size of Last data : " + sizeOfLastPayload);
+	}
+
 	// create segment and send
 	public class sendThread extends Thread {
-		String rInetAddress;
-		int rPort;
-		FileInputStream fis = null;
 
 		public void run() {
 			try {
-				String localIPAddress = InetAddress.getLocalHost().getHostAddress();
-				int localPort = getLocalPort();
+				prepareValues();
 
-				InetSocketAddress address = new InetSocketAddress(localIPAddress, localPort);
-				rInetAddress = getReceiver().getHostName();
-				rPort = getReceiver().getPort();
+				int currentWindowSize = lastMsgSent - lastAckReceived;
 				fis = new FileInputStream(senderFileName);
-				byte[] outData = new byte[getWindowSize()];
+				while (!isTransferComplete && currentWindowSize <= getWindowSize() && !packetList.containsKey(lastMsgSent)) {
+					System.out.println(currentWindowSize + " : " + getWindowSize());
+					if (lastAckReceived == numberOfFrame) {
+						lastMsgSent = lastAckReceived; // no need to send next packet
+						System.out.println("Sender : Successfully transferred " + getFilename() + " (" + fileLength + ") in "
+								+ startTimer.getTimeElapsed() + " seconds");
+						isTransferComplete = true;
+						System.exit(0);
+						// TODO : Send statistics packet
+					} else {
+						s.acquire();
+						sendPayload(lastMsgSent);
 
-				String destinationIPAddress = getReceiver().getAddress().getHostAddress();
-
-				String fileName = getFilename();
-				fileLength = new File(fileName).length();
-
-				int payloadLength = MTU - headerLength;
-
-				// add 4 bytes because in first frame 4 byte is taken by num of frames
-				// + 1 adding last frame
-				int totalBytesToSend = (int) fileLength + 4;
-				numberOfFrame = totalBytesToSend / payloadLength + 1;
-				int sizeOfLastFrame = totalBytesToSend % payloadLength;
-
-				System.out.println("Sending " + fileName + " from " + localIPAddress + ":" + localPort + " to "
-						+ destinationIPAddress + ":" + rPort + " with " + fileLength + " bytes");
-				System.out.println("Sender : Using " + getModeName());
-				System.out.println("Sender : No of frames: " + numberOfFrame + " and Size of Last frame: " + sizeOfLastFrame);
-
-				try {
-					boolean isFinalSequenceNum = false;
-
-					while (!isTransferComplete) {
-						int dataLength = 0;
-						byte[] dataBuffer, dataBytes;
-
-						if (lastAckReceived == numberOfFrame) {
-							isTransferComplete = true;
-							lastMsgSent = lastAckReceived; // no need to send next packet
-							System.out.println("Sender : Successfully transferred " + getFilename() + " (" + fileLength + ") in "
-									+ startTimer.getTimeElapsed() + " seconds");
-							System.exit(0);
-							// send statistics packet
-						} else {
-							// if next to be send is within window size from last ack received
-							int currentWindowSize = lastMsgSent - lastAckReceived;
-
-							// if smaller than window size and not final packet
-							if (currentWindowSize < getWindowSize()) {
-								// System.out.println("joy");
-								s.acquire();
-								if (packetList.containsKey(lastMsgSent)) { // if in packetlist retrieve
-									outData = packetList.get(lastMsgSent);
-								} else { // else create and add to list only till window size
-									// first packet
-									setTimer(true);
-									if (lastMsgSent == 1) {
-										System.out.println("asdfasdfas");
-
-										byte[] numberOfFrameBytes = ByteBuffer.allocate(4).putInt(numberOfFrame).array();
-										dataBuffer = new byte[MTU - 4]; // for first packet 4 less
-										dataLength = fis.read(dataBuffer, 0, payloadLength - 4);
-										dataBytes = copyOfRange(dataBuffer, 0, dataLength);
-										ByteBuffer BB = ByteBuffer.allocate(MTU);
-										BB.put(numberOfFrameBytes);
-										BB.put(dataBytes);
-										outData = generatePacket(lastMsgSent, BB.array());
-									} else {
-										// if (packetList.size() <= getWindowSize()) {
-										dataBuffer = new byte[MTU];
-										dataLength = fis.read(dataBuffer, 0, payloadLength);
-										if (dataLength == -1) { // no more data to be read
-											// isFinalSequenceNum = true;
-											// outData = generatePacket(lastMsgSent, new byte[0]);
-											// System.out.println("Sender : File read completed");
-										} else { // not last packet
-											dataBytes = copyOfRange(dataBuffer, 0, dataLength);
-											outData = generatePacket(lastMsgSent, dataBytes);
-										}
-										// }
-										packetList.put(lastMsgSent, outData);
-									}
-								}
-
-								// rInetAddress
-								// sending the packet
-								dgSocket.send(new DatagramPacket(outData, outData.length, InetAddress.getByName("localhost"), rPort));
-
-								int totalBytes = outData.length;
-
-								// if (dataLength == -1) {
-								// System.out.println("Sender : Message EOF packet sent with " + totalBytes + "
-								// bytes of actual data");
-								// } else {
-
-								System.out.println("Sender : Message " + lastMsgSent + " sent with " + totalBytes
-										+ " bytes of actual data." + " Last ack received : " + lastAckReceived);
-								// }
-
-								if (lastMsgSent < numberOfFrame) {
-									lastMsgSent++;
-								}
-								s.release();
-							}
-							// else {
-							// // out of window, waiting for ack for first packet in buffer
-							// int nextExpectedAck = lastAckReceived + 1;
-							// System.out.println("Sender : Window full. To slide window, Waiting ACK for :
-							// " + nextExpectedAck);
-							// sleep(300);
-							// }
-							sleep(5);
-							// setTimer(true);
+						setTimer(true, lastMsgSent);
+						if (lastMsgSent < numberOfFrame) {
+							lastMsgSent++;
 						}
-						// here either window full or final received
-
+						s.release();
 					}
-				} catch (Exception e) {
-					e.printStackTrace();
-				} finally {
-					setTimer(false);
-					// dgSocket.close();
-					fis.close();
-					// System.out.println("Sender : Connection Socket Closed.");
+					// here either window full or final received
 				}
 			} catch (Exception e) {
 				e.printStackTrace();
 				System.exit(-1);
+			} finally {
+				// dgSocket.close();
+				// System.out.println("Sender : Connection Socket Closed.");
 			}
 		}
+
 	}
 
 	// returns -1 if corrupted, else return Ack number
@@ -265,9 +266,7 @@ public class RSendUDP implements RSendUDPI {
 					while (!isTransferComplete) {
 						dgSocket.receive(inPacket);
 						int ackNum = decodePacket(inData);
-
 						int totalTime = (int) getTimeout() * timerCounter;
-
 						if (lastAckReceived == numberOfFrame) {
 							isTransferComplete = true;
 							lastMsgSent = lastAckReceived; // no need to send next packet
@@ -276,10 +275,10 @@ public class RSendUDP implements RSendUDPI {
 
 							// dgSocket.close();
 						} else {
-
 							// discard the packet
-							if (lastAckReceived > ackNum) {
-								System.out.println("Sender : Message " + ackNum + " acknowledged. [Discarded] ");
+							if (lastAckReceived >= ackNum) {
+								System.out.println(
+										"Sender : Message " + ackNum + " acknowledged. [Discarded] " + " Window : " + getKeysFromWindow());
 							} else {
 								// if (ackNum == FINAL_ACK_NO) {
 								// packetList.remove(ackNum);
@@ -290,18 +289,44 @@ public class RSendUDP implements RSendUDPI {
 
 								int dummyAckNum = ackNum + 1;
 								// packetList.remove(ackNum);
-								System.out.println("Sender : Message " + ackNum + " acknowledged. Waiting for Ack : " + dummyAckNum);
+
 								// packetList.remove(ackNum);
 
-								if (ackNum <= numberOfFrame) {
-									lastAckReceived = ackNum; // update lastAckReceived number
+								if (ackNum < numberOfFrame) {
 									s.acquire(); /***** enter CS *****/
-									if (lastAckReceived == lastMsgSent) {
-										setTimer(false); // if no more unacknowledged packets in pipe, off timer
-									} else {
-										setTimer(true); // else packet acknowledged, restart timer
+									if (packetList.containsKey(ackNum)) {
+										packetList.remove(ackNum);
 									}
+									lastAckReceived = ackNum; // update lastAckReceived number
+									setTimer(false, ackNum); // else packet acknowledged, restart timer
+									// if (lastAckReceived == lastMsgSent) {
+									// setTimer(false); // if no more unacknowledged packets in pipe, off timer
+									// } else {
+									// }
 									s.release(); /***** leave CS *****/
+									System.out.println("Sender : Message " + ackNum + " acknowledged. Waiting for Ack : " + dummyAckNum
+											+ " Removed : " + ackNum + "  Window : " + getKeysFromWindow());
+								}
+
+								if (ackNum == numberOfFrame) {
+									s.acquire(); /***** enter CS *****/
+									if (packetList.containsKey(ackNum)) {
+										packetList.remove(ackNum);
+									}
+									lastAckReceived = ackNum; // update lastAckReceived number
+									setTimer(false, ackNum); // else packet acknowledged, restart timer
+									// if (lastAckReceived == lastMsgSent) {
+									// setTimer(false); // if no more unacknowledged packets in pipe, off timer
+									// } else {
+									// }
+									s.release(); /***** leave CS *****/
+									System.out.println("Sender : Message " + ackNum + " acknowledged." + " Removed :" + ackNum
+											+ "  Window : " + getKeysFromWindow());
+
+									isTransferComplete = true;
+									System.out.println("Sender : Successfully transferred " + getFilename() + " (" + fileLength + ") in "
+											+ startTimer.getTimeElapsed() + " seconds");
+									System.exit(0);
 								}
 								// }
 							}
@@ -320,13 +345,55 @@ public class RSendUDP implements RSendUDPI {
 		}
 	}
 
+	public String getRunningTimerList() {
+		String allKeys = "";
+		for (Map.Entry<Integer, Timer> entry : timerList.entrySet()) {
+			allKeys = allKeys + " " + entry.getKey();
+		}
+		return allKeys;
+	}
+
 	// Timeout task
 	public class Timeout extends TimerTask {
+		int seqNum;
+
+		public Timeout(int seqNum) {
+			this.seqNum = seqNum;
+		}
+
+		// this function runs after timeout
 		public void run() {
 			try {
 				s.acquire(); /***** enter CS *****/
-				lastMsgSent = lastAckReceived + 1; // resets nextSeqNum
-				System.out.println("Sender : Timout. Resending from Message : " + lastMsgSent);
+				byte[] resendData = packetList.get(seqNum);
+				// lastMsgSent = seqNum; // resets nextSeqNum
+
+				if (seqNum > lastAckReceived) {
+					if (timerList.containsKey(seqNum)) {
+						try {
+							dgSocket
+									.send(new DatagramPacket(resendData, resendData.length, InetAddress.getByName("localhost"), rPort));
+						} catch (Exception e) {
+							e.printStackTrace();
+						}
+
+					}
+					retransmission++;
+					if (retransmission / numberOfFrame > 7) {
+						System.out.println("Sender : Re-transmission limit reached. Please re-run." + seqNum);
+						System.exit(0);
+					}
+					System.out.println("Sender : Timout. Resend Message : " + seqNum);
+				} else {
+					timerList.remove(seqNum);
+					while (timerList.containsKey(seqNum - 1)) {
+						Timer ackTimer = timerList.get(seqNum);
+						ackTimer.cancel();
+						timerList.remove(seqNum);
+					}
+					this.cancel();
+				}
+
 				s.release(); /***** leave CS *****/
 			} catch (InterruptedException e) {
 				e.printStackTrace();
@@ -335,14 +402,34 @@ public class RSendUDP implements RSendUDPI {
 	}// END CLASS Timeout
 
 	// to start or stop the timer
-	public void setTimer(boolean isNewTimer) {
-		if (timer != null)
-			timer.cancel();
+	public void setTimer(boolean isNewTimer, int seqNum) {
 		if (isNewTimer) {
 			timer = new Timer();
-			System.out.println("timer started");
-			timer.schedule(new Timeout(), TIME_OUT);
+			Timeout packetTimeOut = new Timeout(seqNum);
+			timer.schedule(packetTimeOut, 500, TIME_OUT);
+			timerList.put(seqNum, timer);
+
+			System.out.println("Sender : Timer for " + seqNum + " started. Timer list : " + getRunningTimerList());
+
+		} else {
+			if (timerList.containsKey(seqNum)) {
+				Timer ackTimer = timerList.get(seqNum);
+				ackTimer.cancel();
+				timerList.remove(seqNum);
+
+				while (timerList.containsKey(seqNum - 1)) {
+					ackTimer = timerList.get(seqNum);
+					ackTimer.cancel();
+					timerList.remove(seqNum);
+				}
+
+				System.out.println("Sender : Timer for Message : " + seqNum + " closed. Timer list : " + getRunningTimerList());
+			} else {
+				System.out.println("Sender : Timer for Message : " + seqNum + " not in list.");
+			}
+
 		}
+
 	}
 
 	// constructs the packet prepended with header information
@@ -430,5 +517,13 @@ public class RSendUDP implements RSendUDPI {
 		byte[] destArr = new byte[length];
 		System.arraycopy(srcArr, start, destArr, 0, length);
 		return destArr;
+	}
+
+	public String getKeysFromWindow() {
+		String allKeys = "";
+		for (Map.Entry<Integer, byte[]> entry : packetList.entrySet()) {
+			allKeys = allKeys + " " + entry.getKey();
+		}
+		return allKeys;
 	}
 }
