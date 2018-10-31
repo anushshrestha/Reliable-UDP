@@ -12,15 +12,17 @@ import java.util.concurrent.Semaphore;
 import edu.utulsa.unet.UDPSocket;
 import edu.utulsa.unet.RReceiveUDPI;
 
+/**
+ * @author anush shrestha
+ */
 public class RReceiveUDP implements RReceiveUDPI {
 
 	int MODE = 0; // 0 is stop and wait
-	long WINDOW_SIZE = 10; // bytes
+	long WINDOW_SIZE = 256; // bytes
 	long TIME_OUT = 1000; // in millisecond
-	String receiverFileName;
-	int localPort = 32456;
+	String receiverFileName = "less_important.txt";
+	int localPort = 12987;
 	int MTU = 200;
-
 	int prevSeqNum = 0; // previous sequence number received in-order
 	int nextSeqNum = 1; // next expected sequence number
 	TreeMap<Integer, byte[]> packetList;
@@ -34,6 +36,7 @@ public class RReceiveUDP implements RReceiveUDPI {
 	int payLoadLength;
 	int totalFileSize = 0;
 	int extraBytesLastPayload = 0;
+	int fileLength, totalTime;
 
 	public static void main(String[] args) {
 		RReceiveUDP receiver = new RReceiveUDP();
@@ -45,7 +48,6 @@ public class RReceiveUDP implements RReceiveUDPI {
 	}
 
 	public boolean receiveFile() {
-
 		boolean isTransferComplete = false; // (flag) if transfer is complete
 		s = new Semaphore(1);
 		packetList = new TreeMap<Integer, byte[]>();
@@ -91,6 +93,7 @@ public class RReceiveUDP implements RReceiveUDPI {
 				try {
 
 					boolean isFinalPacketReceived = false;
+					boolean isStatPacketReceived = false;
 					File file = new File(getFilename());
 					fos = new FileOutputStream(file);
 					while (!isTransferComplete) {
@@ -100,50 +103,46 @@ public class RReceiveUDP implements RReceiveUDPI {
 
 						// transfer completes if last packet received, no of frame is equal to current
 						// seq no
+						dgSocket.receive(inPacket);
+
+						rAddress = inPacket.getAddress();
+						rPort = inPacket.getPort();
+
+						int seqNum = ByteBuffer.wrap(copyOfRange(inData, 0, 4)).getInt();
+
 						if (prevSeqNum == numberOfFrame) {
-							isTransferComplete = true;
 							nextSeqNum = prevSeqNum; // no need to wait next packet
+							isTransferComplete = true;
 
 							System.out.println("Receiver : Successfully received " + getFilename());
+							dgSocket.close();
+							System.exit(0);
 							// " ("
 							// + (file.length() - extraBytesLastPayload) + ") bytes");
-							System.exit(0);
-
+							// System.exit(0);
 						} else {
-							// transfer not completed
-							dgSocket.receive(inPacket);
 
-							rAddress = inPacket.getAddress();
-							rPort = inPacket.getPort();
-
-							int seqNum = ByteBuffer.wrap(copyOfRange(inData, 0, 4)).getInt();
-							System.out.println("Receiver : " + "Received Msg " + seqNum + " Last sent Ack : " + prevSeqNum
-									+ " Next Expected Msg : " + nextSeqNum + "  Window : " + getKeysFromWindow());
-							// packet retransmitted or already in buffer just ack no changes
 							if (seqNum <= prevSeqNum || packetList.containsKey(seqNum)) {
 								byte[] ackPkt = generatePacket(prevSeqNum);
+
 								dgSocket.send(new DatagramPacket(ackPkt, ackPkt.length, rAddress, rPort));
+
 								System.out.println("Receiver : Message " + seqNum + " re-received. Resend ack [Discarded] "
-										+ " Window : " + getKeysFromWindow());
+										+ " Next Expected Msg : " + nextSeqNum + " Window : " + getKeysFromWindow());
 								// if (packetList.containsKey(seqNum)) {
 								// packetList.remove(seqNum);
 								// }
 							} else {
 								// first time transmitted
 								// dont discard package until within window size or is waiting packet
-
 								// first packet has no of frames
-
 								lengthToUse = ByteBuffer.wrap(copyOfRange(inData, 4, 8)).getInt();
 
 								numberOfFrame = ByteBuffer.wrap(copyOfRange(inData, 8, 12)).getInt();
 
 								byte[] payload = new byte[MTU - headerLength]; // header length 4, no of frame 4
-								payload = copyOfRange(inData, headerLength, MTU);
+								payload = copyOfRange(inData, headerLength, payLoadLength);
 
-								if (seqNum == numberOfFrame) {
-									int extraBytesLastPayload = MTU - headerLength - lengthToUse;
-								}
 								// if final packet
 								// if (inPacket.getLength() == 4) {
 								// // send ack
@@ -153,16 +152,41 @@ public class RReceiveUDP implements RReceiveUDPI {
 								// System.out.println("Receiver : EOF Received. Send Ack : EOF Buffer : " +
 								// getKeysFromWindow());
 								// last statistics packet
-								if (seqNum == -2) {
-									// last statistics package
+								// in order, packet as expected
+								if (seqNum == nextSeqNum) {
+									// // if (seqNum <= numberOfFrame) {
+									// System.out.println("pay:" + payload);
+									// byte[] numberOfFrameBytes = ByteBuffer.allocate(4).putInt(100).array();
 
-								} else { // not statistics packet
+									if (seqNum == numberOfFrame) {
+										int extraBytesLastPayload = MTU - headerLength - lengthToUse;
 
-									// in order, packet as expected
-									if (seqNum == nextSeqNum) {
-										// // if (seqNum <= numberOfFrame) {
-										// System.out.println("pay:" + payload);
-										// byte[] numberOfFrameBytes = ByteBuffer.allocate(4).putInt(100).array();
+										byte[] ackPkt = generatePacket(seqNum);
+
+										fos.write(payload);
+
+										for (int i = 0; i < 5; i++) {
+											dgSocket.send(new DatagramPacket(ackPkt, ackPkt.length, rAddress, rPort));
+											sleep(1000);
+										}
+
+										System.out.println("Receiver : " + "In order Received : " + seqNum + " Send Ack : " + seqNum
+												+ " Next Expected Msg : None " + "  Window : " + getKeysFromWindow());
+
+										if (getMode() == 0 && seqNum == numberOfFrame) {
+											System.out.println("Receiver : Successfully received " + getFilename());
+											dgSocket.close();
+											System.exit(0);
+										}
+
+										if (seqNum == prevSeqNum) {
+											System.out.println("Receiver : Successfully received " + getFilename());
+											dgSocket.close();
+											System.exit(0);
+										}
+
+									} else {
+
 										fos.write(payload);
 										// current in order might be in buffer before due to out of order
 										if (packetList.containsKey(seqNum)) {
@@ -177,8 +201,9 @@ public class RReceiveUDP implements RReceiveUDPI {
 										byte[] ackPkt = generatePacket(prevSeqNum);
 
 										dgSocket.send(new DatagramPacket(ackPkt, ackPkt.length, rAddress, rPort));
+
 										System.out.println("Receiver : In order Received : " + seqNum + ". Send Ack : " + seqNum
-												+ "  Window : " + getKeysFromWindow());
+												+ " Next Expected Msg : " + nextSeqNum + "  Window : " + getKeysFromWindow());
 
 										// now check in buffer
 										// for other pending acks, select largest continuous ack, remove from
@@ -196,28 +221,47 @@ public class RReceiveUDP implements RReceiveUDPI {
 												}
 											}
 
+											// send ack only for largest one
+											ackPkt = generatePacket(largestContinuousSeqNum);
+
+											dgSocket.send(new DatagramPacket(ackPkt, ackPkt.length, rAddress, rPort));
+
 											System.out.println("Receiver : Received [Highest msg from window] : " + largestContinuousSeqNum
 													+ ". Send Ack : " + largestContinuousSeqNum);
 
-											// send ack only for largest one
-											ackPkt = generatePacket(largestContinuousSeqNum);
-											dgSocket.send(new DatagramPacket(ackPkt, ackPkt.length, rAddress, rPort));
-										}
-									} else { // not in order so now check for window to buffer
-										if (!packetList.containsKey(seqNum)) {
-											if (packetList.size() < getWindowSize()) {
-												s.acquire();
-												packetList.put(seqNum, payload);
-												System.out.println(
-														"Receiver : Out of order Received: " + seqNum + "  Window : " + getKeysFromWindow());
-												// normal packets
-												// for first packet
-												s.release();
+											if (largestContinuousSeqNum == numberOfFrame) {
+												for (int i = 0; i < 2; i++) {
+													dgSocket.send(new DatagramPacket(ackPkt, ackPkt.length, rAddress, rPort));
+												}
+												System.out.println("Receiver : Successfully received " + getFilename());
+												dgSocket.close();
+												System.exit(0);
 											}
 										}
-										// not in order and window full so discarded
 									}
+								} else { // not in order so now check for window to buffer
+									if (!packetList.containsKey(seqNum)) {
+										if (packetList.size() < getWindowSize()) {
+											s.acquire();
+											packetList.put(seqNum, payload);
+											System.out.println("Receiver : Out of order Received: " + seqNum + " Next Expected Msg : "
+													+ nextSeqNum + "  Window : " + getKeysFromWindow());
+											// normal packets
+											// for first packet
+											s.release();
+										}
+									}
+									// not in order and window full so discarded
+									// so send ack back of last ack received
+
+									byte[] ackPkt = generatePacket(prevSeqNum);
+									for (int i = 0; i < 5; i++) {
+										dgSocket.send(new DatagramPacket(ackPkt, ackPkt.length, rAddress, rPort));
+									}
+									System.out
+											.println("Receiver : Re-send ack for Msg : " + prevSeqNum + "  Window : " + getKeysFromWindow());
 								}
+
 							}
 						}
 					}
@@ -265,7 +309,9 @@ public class RReceiveUDP implements RReceiveUDPI {
 
 	public boolean setMode(int mode) {
 		this.MODE = mode;
-		this.setModeParameter(1);
+		if (mode == 0) {
+			this.setModeParameter(1);
+		}
 		return true;
 	}
 
@@ -281,7 +327,11 @@ public class RReceiveUDP implements RReceiveUDPI {
 	}
 
 	public boolean setModeParameter(long n) {
-		this.WINDOW_SIZE = n;
+		if (getMode() == 0) {
+			this.WINDOW_SIZE = 1;
+		} else {
+			this.WINDOW_SIZE = n;
+		}
 		return true;
 	}
 
@@ -314,15 +364,15 @@ public class RReceiveUDP implements RReceiveUDPI {
 	public class Timeout extends TimerTask {
 		public void run() {
 			try {
-				s.acquire(); /***** enter CS *****/
+				s.acquire();
 				System.out.println("Sender : Timeout!");
 				nextSeqNum = prevSeqNum; // resets nextSeqNum
-				s.release(); /***** leave CS *****/
+				s.release();
 			} catch (InterruptedException e) {
 				e.printStackTrace();
 			}
 		}
-	}// END CLASS Timeout
+	}
 
 	// to start or stop the timer
 	public void setTimer(boolean isNewTimer) {
